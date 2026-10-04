@@ -42,7 +42,10 @@ docker compose logs -f
 ```
 
 可选环境变量：`EVAC_PORT`（默认 8080）、`EVAC_DB`（默认 ./data/evac.db）、
-`EVAC_NO_SEED=1`（关闭演示数据播种）。
+`EVAC_NO_SEED=1`（关闭演示数据播种）、
+`EVAC_CURSOR_TTL`（审批游标有效期秒数，默认 300）、
+`EVAC_AUDIT_USERS`（审批工作台令牌，格式 `令牌:姓名:audit:read|audit:write`，
+逗号分隔多个；未设置时使用演示令牌 audit-admin / auditor-li / observer-zou / operator-wu）。
 
 ### 重置/重建演示数据
 
@@ -94,6 +97,12 @@ python3 seed_demo.py --reset
   与字段；附分支审计流。
 - **资源与导入**：JSON 批量导入网格/道路/避难点/车辆（同 code 幂等覆盖）。
 - **受威胁住户**：表单登记人数、行动辅助、宠物、联络；同户号重复导入自动忽略。
+- **🧾 审批追踪**：运营审计员的独立工作台。申请/批准/拒绝/失效/执行失败串成
+  只追加时间线；按操作者、复核者、动作种类、结果状态、起止时刻组合过滤，
+  HMAC 游标分段（过期 410、篡改/改过滤 400、缺观察权限 401/403、过滤值非法 400）。
+  一键锁定查询截面生成 **JSON / CSV 报表**：两格式字段、顺序、明细完全相同，
+  重复下载逐字节是同一份文件（ETag/Content-SHA256、304）；
+  进程重启后仍可校验读取，之后新增决策不改写先前截面。
 - **事件日志**：所有导入、发布、离场、封路/恢复等审计记录（含修订号）。
 
 ## 规划模型
@@ -123,6 +132,11 @@ python3 tests/branch_test.py     # 推演分支端到端测试（45 项）：
                                  # 创建/模拟幂等、物理隔离、并排差异、
                                  # 三方冲突/过期基线整体拒绝、
                                  # 承诺不迁移、废弃、重启恢复
+python3 tests/approval_test.py   # 审批追踪工作台端到端测试（45 项）：
+                                 # 401/403 权限、申请状态机、写入幂等、
+                                 # 组合过滤、游标分页/篡改/过期410、
+                                 # JSON/CSV 同源、重复下载同一份、
+                                 # 截面冻结不被后增决策改写、重启后校验读取
 ```
 
 ## 推演沙盒操作流程
@@ -142,10 +156,11 @@ python3 tests/branch_test.py     # 推演分支端到端测试（45 项）：
 ## 目录结构
 
 ```
-backend/   db.py(持久化+修订号+分支元数据) planner.py(路径/搜索/诊断/校验)
-           branches.py(分支库/指纹/三方合并/提升/并排差异) seed.py server.py(HTTP+事务)
-frontend/  index.html styles.css app.js (地图/批次/方案/沙盒/资源/住户/日志)
-tests/     planner_test.py e2e_test.py branch_test.py
+backend/   db.py(持久化+修订号+分支元数据+审批表) planner.py(路径/搜索/诊断/校验)
+           branches.py(分支库/指纹/三方合并/提升/并排差异) approvals.py(审批时间线/
+           签名游标/冻结报表JSON·CSV) relay_link.py seed.py server.py(HTTP+事务)
+frontend/  index.html styles.css app.js (地图/批次/方案/沙盒/资源/住户/审批追踪/日志)
+tests/     planner_test.py e2e_test.py branch_test.py approval_test.py
 data/      SQLite 数据库（运行时生成，挂载卷持久化）
            data/branches/  各推演分支的独立数据库文件
 Dockerfile docker-compose.yml run.sh seed_demo.py API.md

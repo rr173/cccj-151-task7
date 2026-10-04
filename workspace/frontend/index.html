@@ -17,6 +17,7 @@
     <button data-tab="sandbox" class="tab sandbox-tab">🧪 推演沙盒</button>
     <button data-tab="resources" class="tab">资源与导入</button>
     <button data-tab="households" class="tab">受威胁住户</button>
+    <button data-tab="audit" class="tab audit-tab">🧾 审批追踪</button>
     <button data-tab="log" class="tab">事件日志</button>
   </nav>
   <div class="revbox">
@@ -213,6 +214,120 @@
       </div>
       <p class="muted">同户号重复导入将被忽略（不会重复登记，也不会覆盖已有登记）。</p>
       <table class="grid-table" id="hhTable"></table>
+    </div>
+  </section>
+
+  <!-- ============ 审批追踪工作台 ============ -->
+  <section id="tab-audit" class="tabpanel">
+    <div class="card">
+      <div class="row-between">
+        <h2>🧾 审批追踪工作台</h2>
+        <div class="audit-auth">
+          <select id="auditToken" class="inp small">
+            <option value="">未登录（选择审计身份）</option>
+            <option value="audit-admin">林审计 · 读写（audit:read + audit:write）</option>
+            <option value="auditor-li">李观察 · 只读（audit:read）</option>
+            <option value="observer-zou">邹巡查 · 只读（audit:read）</option>
+            <option value="operator-wu">吴调度 · 只写（audit:write，无观察权限）</option>
+          </select>
+          <span id="auditWho" class="muted"></span>
+        </div>
+      </div>
+      <p class="muted">把每个申请的<b>申请 → 批准 / 拒绝 → 失效 / 执行失败</b>串成只追加时间线；
+        可按操作者、复核者、动作种类、结果状态与起止时刻组合过滤并游标分段读取。
+        生成报表会<b>锁定查询截面</b>：JSON 与 CSV 字段、顺序、明细完全相同，重复下载是同一份文件；
+        进程重启后仍可校验读取，之后新增的决策不会改写先前截面。</p>
+      <div id="auditPermMsg" class="unassigned-box" hidden></div>
+    </div>
+
+    <div class="card" id="auditReaderCard">
+      <h3>组合过滤</h3>
+      <div class="audit-filters">
+        <label>操作者 <input id="afOperator" class="inp small" placeholder="如 周调度"></label>
+        <label>复核者 <input id="afReviewer" class="inp small" placeholder="如 林审计 / system"></label>
+        <label>动作种类
+          <select id="afAction" class="inp small">
+            <option value="">全部</option>
+            <option value="evacuation_order">撤离令 evacuation_order</option>
+            <option value="resource_change">资源变更 resource_change</option>
+            <option value="shelter_access">避难点接收 shelter_access</option>
+            <option value="vehicle_dispatch">车辆调度 vehicle_dispatch</option>
+            <option value="relief_resource">救济资源 relief_resource</option>
+          </select>
+        </label>
+        <label>结果状态
+          <select id="afResult" class="inp small">
+            <option value="">全部</option>
+            <option value="requested">申请 requested</option>
+            <option value="approved">批准 approved</option>
+            <option value="rejected">拒绝 rejected</option>
+            <option value="invalidated">失效 invalidated</option>
+            <option value="execution_failed">执行失败 execution_failed</option>
+          </select>
+        </label>
+        <label>起始 <input id="afStart" type="datetime-local" class="inp small" step="1"></label>
+        <label>截止 <input id="afEnd" type="datetime-local" class="inp small" step="1"></label>
+        <label>每页
+          <select id="afLimit" class="inp xs">
+            <option>10</option><option selected>20</option><option>50</option><option>100</option><option>500</option>
+          </select>
+        </label>
+        <button id="afSearch" class="primary">查询（回第一页）</button>
+        <button id="afReset" class="mini">清空</button>
+      </div>
+
+      <div class="row-between" style="margin-top:10px">
+        <div id="afPageInfo" class="muted"></div>
+        <div>
+          <button id="afPrev" class="mini" disabled>上一页</button>
+          <button id="afNext" class="mini" disabled>下一页</button>
+          <button id="afReport" class="publish">按当前条件锁定截面并生成报表</button>
+        </div>
+      </div>
+      <div id="afMsg"></div>
+      <div class="diff-table-wrap"><table class="grid-table" id="afTable"></table></div>
+    </div>
+
+    <div class="card" id="auditWriterCard">
+      <h3>登记审批事件（需要 audit:write）</h3>
+      <div class="audit-filters">
+        <label>动作
+          <select id="awAction" class="inp small">
+            <option value="evacuation_order">撤离令</option>
+            <option value="resource_change">资源变更</option>
+            <option value="shelter_access">避难点接收</option>
+            <option value="vehicle_dispatch">车辆调度</option>
+            <option value="relief_resource">救济资源</option>
+          </select>
+        </label>
+        <label>结果
+          <select id="awResult" class="inp small">
+            <option value="requested">申请</option>
+            <option value="approved">批准</option>
+            <option value="rejected">拒绝</option>
+            <option value="invalidated">失效</option>
+            <option value="execution_failed">执行失败</option>
+          </select>
+        </label>
+        <label>申请号 <input id="awRequest" class="inp small" placeholder="申请时可留空自动生成"></label>
+        <label>操作者 <input id="awOperator" class="inp small" placeholder="留空取登录身份"></label>
+        <label>复核者 <input id="awReviewer" class="inp small" placeholder="批准/拒绝必填"></label>
+        <label>对象 <input id="awSubject" class="inp small" placeholder="如 BATCH-V1-07 / road:r5"></label>
+        <label class="grow2">明细 JSON
+          <input id="awDetail" class="inp" placeholder='{"reason":"车辆故障"} 或留空为 {}'>
+        </label>
+        <button id="awSubmit" class="primary">追加事件</button>
+      </div>
+      <p class="muted">同一申请先有「申请」，后续结果按 request_id 续接；拒绝/失效为终态。
+        执行失败后可重新批准重试。所有事件只追加，时间线与已锁定报表都不会被改写。</p>
+    </div>
+
+    <div class="card">
+      <div class="row-between">
+        <h3>已锁定的报表截面</h3>
+        <button id="afReloadReports" class="mini">刷新列表</button>
+      </div>
+      <div id="afReports" class="report-list"></div>
     </div>
   </section>
 

@@ -145,3 +145,73 @@
   - 合法回执返回 `{"result":"ack"}`；`departed` 类联动既有离场承诺语义。
 
 中继自身 API（执行包导入、终端下载、批量回执、重试、审计）见 [relay/API.md](relay/API.md)。
+
+## 审批追踪工作台（运营审计员，独立只读截面）
+
+`/api/approvals/...` 是面向运营审计员的**独立工作台**，把每个申请的
+**申请 → 批准 / 拒绝 → 失效 / 执行失败**串成只追加（append-only）时间线。
+所有接口都要审计令牌：请求头 `Authorization: Bearer <令牌>` 或 `X-Audit-Token: <令牌>`。
+
+- 演示令牌（可用环境变量 `EVAC_AUDIT_USERS` 整体覆盖，格式
+  `令牌:姓名:角色1|角色2,...`，逗号分隔）：
+  - `audit-admin` 林审计：`audit:read` + `audit:write`
+  - `auditor-li` 李观察 / `observer-zou` 邹巡查：仅 `audit:read`
+  - `operator-wu` 吴调度：仅 `audit:write`（**无观察权限**，读接口返回 403）
+- 无令牌/坏令牌 → **401 unauthorized**；已认证但缺权限 → **403 forbidden**
+  （机器码均为 `code` 字段）。
+
+枚举（非法值一律 **400 invalid_filter / invalid_field**，并在 `allowed` 回带合法集合）：
+
+| 维度 | 取值 |
+|---|---|
+| 动作 `action` | `evacuation_order` 撤离令 / `resource_change` 资源变更 / `shelter_access` 避难点接收 / `vehicle_dispatch` 车辆调度 / `relief_resource` 救济资源 |
+| 结果 `result` | `requested` 申请 / `approved` 批准 / `rejected` 拒绝 / `invalidated` 失效 / `execution_failed` 执行失败 |
+
+状态机：每个申请先有一条 `requested`；之后按 `request_id` 续接
+approved/rejected/invalidated/execution_failed。`rejected`/`invalidated` 为终态；
+执行失败后可重新批准重试，但不能重开 `requested`。批准/拒绝必须带 `reviewer`。
+
+### 追加审批事件（需要 audit:write）
+`POST /api/approvals/events`
+```json
+{"request_id":"REQ-...（申请时可留空自动生成）","action":"evacuation_order",
+ "result":"approved","operator":"周调度（留空取登录身份）","reviewer":"李观察",
+ "subject":"BATCH-V1-07","detail":{...},"idem_key":"可选写入幂等键","ts":"可选，epoch秒或ISO8601"}
+```
+相同 `idem_key` 永远返回首次记录（`idempotent_replay:true`）。非法迁移 → 409
+（`duplicate_request`/`illegal_transition`），续接不存在的申请 → 404 `request_not_found`。
+
+### 时间线查询（需要 audit:read，游标分段）
+`GET /api/approvals/timeline`，可任意组合：
+`operator`、`reviewer`、`action`（逗号分隔多值）、`result`（多值，也接受 `status`）、
+`start`/`end`（epoch 秒或 ISO 8601，含端点；start>end → 400）、
+`limit`（1..500，默认 100）、`cursor`（上一页 `next_cursor`，不透明）。
+
+返回 `events[]`（默认按 seq 倒序）、`has_more`、`next_cursor`。游标为
+**HMAC 签名**（密钥持久化在库，重启后仍有效）并携带：筛选条件指纹
+（翻页改过滤 → **400 cursor_filter_mismatch**）、有效期
+（默认 300 秒，`EVAC_CURSOR_TTL` 可调；过期 → **410 cursor_expired**）、
+被篡改/格式错 → **400 cursor_invalid**。
+
+### 报表截面（锁定查询，JSON/CSV 同源）
+- `POST /api/approvals/reports` `{"filters":{...同上筛选...},"idem_key":"..."}`
+  立即按当前条件查询并把命中行**冻结为只读截面**（记录 `cutoff_seq` 与全部行列）。
+  相同 `idem_key` 返回同一截面；之后新增的审批决策（即使命中相同过滤）
+  **绝不进入**该截面。
+- `GET /api/approvals/reports` / `GET /api/approvals/reports/{id}`
+  截面列表 / 元数据（含两格式下载地址与 SHA-256）。
+- `GET /api/approvals/reports/{id}/download?format=json|csv`
+  **两种格式由同一份冻结行确定性渲染**：字段、列顺序与每行明细完全一致
+  （列固定为 `seq,timestamp,request_id,action,result,operator,reviewer,subject,detail`，
+  时间为毫秒精度 UTC ISO 8601，`detail` 为规范化 JSON 文本）。
+  重复下载**逐字节相同**，响应带 `ETag` 与 `Content-SHA256`；
+  携带匹配的 `If-None-Match` 返回 **304**（重复点击只拿到同一份文件）。
+  非法格式 → 400 `invalid_format`；截面不存在 → 404 `report_not_found`。
+- `POST /api/approvals/reports/{id}/verify`
+  重新渲染两种格式并与创建时冻结的 SHA-256 比对，同时校验列一致与
+  「最大行 seq ≤ 截止 seq」。**进程重启后仍可校验并读取旧报表**。
+
+错误码汇总：`unauthorized`(401)、`forbidden`(403)、`invalid_filter`/`cursor_invalid`/
+`invalid_field`/`invalid_format`(400)、`cursor_expired`(410)、
+`duplicate_request`/`illegal_transition`(409)、`request_not_found`/`report_not_found`(404)。
+

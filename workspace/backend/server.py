@@ -22,6 +22,7 @@ from planner import Snapshot, plan as run_plan, validate_plan
 from seed import seed
 import branches as branches_mod
 import relay_link
+import approvals
 
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend")
 DB_PATH = os.environ.get("EVAC_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -31,6 +32,10 @@ db = DB(DB_PATH)
 if os.environ.get("EVAC_NO_SEED") != "1" and db.revision() == 0 and not db.get_meta("seeded"):
     seed(db)
     db.set_meta("seeded", "1")
+
+# 审批追踪演示时间线（幂等；只追加，不属于业务重置范围）
+if os.environ.get("EVAC_NO_SEED") != "1":
+    approvals.seed_demo(db)
 
 
 # ---------------------------------------------------------------- 通用工具
@@ -636,6 +641,29 @@ class Handler(BaseHTTPRequestHandler):
                     bid = p.rsplit("/", 1)[-1]
                     return self._json(200,
                                       relay_link.build_execution_package(db, bid))
+
+                # ---- 审批追踪工作台（需要审计观察权限）----
+                if p == "/api/approvals/timeline":
+                    from urllib.parse import parse_qs
+                    approvals.require(self.headers, "audit:read")
+                    return self._json(200, approvals.query_timeline(
+                        db, parse_qs(u.query)))
+                if p == "/api/approvals/reports":
+                    approvals.require(self.headers, "audit:read")
+                    return self._json(200, {"reports": approvals.list_reports(db)})
+                if p.startswith("/api/approvals/reports/"):
+                    from urllib.parse import parse_qs
+                    parts = p.strip("/").split("/")  # api/approvals/reports/rid[/download|verify]
+                    rid = parts[3]
+                    sub = parts[4] if len(parts) > 4 else ""
+                    approvals.require(self.headers, "audit:read")
+                    if sub == "":
+                        return self._json(200, approvals.get_report(db, rid))
+                    if sub == "download":
+                        fmt = parse_qs(u.query).get("format", ["json"])[0]
+                        return self._report_file(db, rid, fmt,
+                                                 self.headers.get("If-None-Match", ""))
+                    raise NotFound("未知报表接口")
             if p.startswith("/api/"):
                 raise NotFound("未知接口")
             return self._static(p)
@@ -643,10 +671,40 @@ class Handler(BaseHTTPRequestHandler):
             self._json(e.status, {"error": str(e), "code": e.code, **e.extra})
         except relay_link.RelayLinkError as e:
             self._json(e.status, {"error": e.message, "code": e.code})
+        except approvals.ApprovalError as e:
+            self._json(e.status, {"error": e.message, "code": e.code, **e.extra})
         except HttpError as e:
             self._json(e.status, {"error": str(e)})
         except Exception as e:  # noqa: BLE001
             self._json(500, {"error": f"服务器内部错误: {e}"})
+
+    def _report_file(self, d, rid, fmt, if_none_match=""):
+        """输出冻结报表文件。同一截面的同格式下载永远逐字节一致：
+
+        内容由冻结行确定性渲染，ETag/Content-SHA256 为该内容的稳定摘要，
+        重复点击下载（含条件请求 If-None-Match）拿到的是同一份文件。
+        """
+        body, fmt, digest, r = approvals.download_report(d, rid, fmt)
+        etag = f'"{rid}.{fmt}.{digest[:16]}"'
+        if if_none_match and if_none_match.strip() == etag:
+            self.send_response(304)
+            self.send_header("ETag", etag)
+            self.end_headers()
+            return
+        ctype = ("application/json; charset=utf-8" if fmt == "json"
+                 else "text/csv; charset=utf-8")
+        ext = "json" if fmt == "json" else "csv"
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition",
+                         f'attachment; filename="{rid}.{ext}"')
+        self.send_header("Content-SHA256", digest)
+        self.send_header("ETag", etag)
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Report-Cutoff-Seq", str(r["cutoff_seq"]))
+        self.end_headers()
+        self.wfile.write(body)
 
     def _branch_response(self, bid, sub, body, method):
         """统一处理分支调用中的锁：分支库与主库锁串行获取（分支操作可能提升回主库）。"""
@@ -696,6 +754,18 @@ class Handler(BaseHTTPRequestHandler):
                     status_code, resp, _replay = relay_link.receive_relay_callback(
                         db, body or {})
                     return self._json(status_code, resp)
+
+                # ---- 审批追踪工作台（写：追加审批事件 / 锁定报表截面 / 校验）----
+                if p == "/api/approvals/events":
+                    user = approvals.require(self.headers, "audit:write")
+                    return self._json(200, approvals.append_event(db, body or {}, user))
+                if p == "/api/approvals/reports":
+                    user = approvals.require(self.headers, "audit:read")
+                    return self._json(201, approvals.create_report(db, body or {}, user))
+                if p.startswith("/api/approvals/reports/") and p.endswith("/verify"):
+                    rid = p.split("/")[4]
+                    approvals.require(self.headers, "audit:read")
+                    return self._json(200, approvals.verify_report(db, rid))
                 if p == "/api/reset":
                     seed(db, reset=True)
                     # 清理已删除元数据的孤立分支数据库文件
@@ -718,6 +788,8 @@ class Handler(BaseHTTPRequestHandler):
             self._json(e.status, {"error": str(e), "code": e.code, **e.extra})
         except relay_link.RelayLinkError as e:
             self._json(e.status, {"error": e.message, "code": e.code})
+        except approvals.ApprovalError as e:
+            self._json(e.status, {"error": e.message, "code": e.code, **e.extra})
         except HttpError as e:
             self._json(e.status, {"error": str(e)})
         except ValueError as e:

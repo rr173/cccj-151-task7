@@ -175,6 +175,43 @@ CREATE TABLE IF NOT EXISTS execution_exports(
   package_hash  TEXT NOT NULL DEFAULT '',
   exported_at   REAL NOT NULL
 );
+
+-- ===================== 审批追踪工作台（运营审计员） =====================
+-- 审批事件是只追加（append-only）的时间线：每个申请至少有一条 requested 记录，
+-- 之后可追加 approved / rejected / invalidated / execution_failed，全过程可检索。
+CREATE TABLE IF NOT EXISTS approval_events(
+  seq        INTEGER PRIMARY KEY AUTOINCREMENT, -- 单调递增，时间线顺序与游标锚点
+  ts         REAL NOT NULL,                     -- 事件发生时刻（epoch 秒）
+  request_id TEXT NOT NULL,                     -- 同一申请的多事件共享
+  action     TEXT NOT NULL,                     -- evacuation_order | resource_change
+                                            -- | shelter_access | vehicle_dispatch
+                                            -- | relief_resource
+  result     TEXT NOT NULL,                     -- requested | approved | rejected
+                                            -- | invalidated | execution_failed
+  operator   TEXT NOT NULL DEFAULT '',          -- 操作者（发起/执行）
+  reviewer   TEXT NOT NULL DEFAULT '',          -- 复核者（批准/拒绝；系统复核记 system）
+  subject    TEXT NOT NULL DEFAULT '',          -- 申请对象（如批次/资源编号）
+  detail     TEXT NOT NULL DEFAULT '',          -- JSON 明细（两格式报表共用的明细载荷）
+  idem_key   TEXT                               -- 写入幂等键（同键重放返回首次结果）
+);
+CREATE INDEX IF NOT EXISTS idx_approval_req ON approval_events(request_id);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_idem
+  ON approval_events(idem_key) WHERE idem_key IS NOT NULL;
+
+-- 报表截面：创建报表时把命中的事件 seq 清单与筛选条件**固化**为只读快照。
+-- 之后新增的审批决策只追加新 seq，绝不改变任何既有报表的行集合（冻结截面）。
+CREATE TABLE IF NOT EXISTS approval_reports(
+  id          TEXT PRIMARY KEY,
+  created_at  REAL NOT NULL,
+  created_by  TEXT NOT NULL DEFAULT '',
+  filters     TEXT NOT NULL,                    -- 创建时的筛选条件（JSON，审计留痕）
+  cutoff_seq  INTEGER NOT NULL,                 -- 截面截止 seq（之后新增事件不计入）
+  columns     TEXT NOT NULL,                    -- 冻结的列名/顺序（JSON 数组）
+  rows_json   TEXT NOT NULL,                    -- 冻结的全部行（JSON，与 CSV 同源）
+  sha256_json TEXT NOT NULL,                    -- JSON 下载体校验摘要
+  sha256_csv  TEXT NOT NULL,                    -- CSV 下载体校验摘要
+  row_count   INTEGER NOT NULL
+);
 """
 
 

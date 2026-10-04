@@ -849,3 +849,362 @@ function renderBlockers(id, blockers, key) {
 
 refresh();
 setInterval(refresh, 6000);
+
+// ============================================================ 审批追踪工作台
+
+const Audit = {
+  token: localStorage.getItem("audit_token") || "",
+  pages: [],          // 已读页的 next_cursor 栈（用于"上一页"）
+  cursor: "",         // 当前页使用的游标（首页为空）
+  nextCursor: "",
+  pageNo: 1,
+  pageSize: 1,
+  hasRead: false,
+  hasWrite: false,
+  who: "",
+};
+
+function auditHeaders() {
+  return Audit.token ? { Authorization: `Bearer ${Audit.token}` } : {};
+}
+
+async function auditApi(path, options = {}) {
+  const opt = { method: options.method || "GET", headers: { ...auditHeaders() } };
+  if (options.body !== undefined) {
+    opt.headers["Content-Type"] = "application/json";
+    opt.body = JSON.stringify(options.body);
+  }
+  const r = await fetch(path, opt);
+  let data;
+  const text = await r.text();
+  try { data = text ? JSON.parse(text) : {}; } catch { data = { raw: text }; }
+  if (!r.ok) {
+    const err = new Error(data.error || `HTTP ${r.status}`);
+    err.payload = data;
+    err.status = r.status;
+    throw err;
+  }
+  return { status: r.status, data, headers: r.headers };
+}
+
+const ACTION_LABEL = {
+  evacuation_order: "撤离令", resource_change: "资源变更", shelter_access: "避难点接收",
+  vehicle_dispatch: "车辆调度", relief_resource: "救济资源",
+};
+const RESULT_STYLE = {
+  requested: ["warn", "申请"], approved: ["ok", "批准"], rejected: ["bad", "拒绝"],
+  invalidated: ["muted-tag", "失效"], execution_failed: ["bad", "执行失败"],
+};
+const fmtIso = (s) => s ? new Date(s).toLocaleString("zh-CN", { hour12: false }) : "";
+const localToIso = (v) => v ? new Date(v).toISOString() : "";
+
+async function auditBoot() {
+  document.getElementById("auditToken").value = Audit.token;
+  if (!Audit.token) {
+    Audit.hasRead = Audit.hasWrite = false;
+    showAuditPerm("选择右上角审计身份后即可查询审批时间线。未携带有效令牌的请求会被拒绝（401）。");
+    document.getElementById("auditReaderCard").style.opacity = ".55";
+    document.getElementById("auditWriterCard").style.opacity = ".55";
+    document.getElementById("afTable").innerHTML = "";
+    document.getElementById("afReports").innerHTML = "";
+    document.getElementById("auditWho").textContent = "";
+    return;
+  }
+  // 用一次轻量查询同时探测读权限
+  try {
+    await auditPage("");
+    Audit.hasRead = true;
+    document.getElementById("auditReaderCard").style.opacity = "";
+    document.getElementById("auditWriterCard").style.opacity = "";
+    document.getElementById("auditPermMsg").hidden = true;
+    const who = { "audit-admin": "林审计（读写）", "auditor-li": "李观察（只读）",
+      "observer-zou": "邹巡查（只读）", "operator-wu": "吴调度（只写，无观察权限）" }[Audit.token];
+    document.getElementById("auditWho").textContent = "当前：" + who;
+    auditLoadReports();
+  } catch (e) {
+    Audit.hasRead = false;
+    document.getElementById("auditReaderCard").style.opacity = ".5";
+    if (e.status === 403) {
+      showAuditPerm("⛔ 当前身份（吴调度）只有 audit:write，没有审批追踪<b>观察权限</b>："
+        + "时间线与报表查询被拒绝（403 forbidden）。可在下方登记审批事件。");
+    } else {
+      showAuditPerm(e.message);
+    }
+  }
+  // 写权限单独探测（不弹错，仅决定表单可用性）
+  Audit.hasWrite = Audit.token === "audit-admin" || Audit.token === "operator-wu";
+  document.getElementById("awSubmit").disabled = !Audit.hasWrite;
+}
+
+function showAuditPerm(msg) {
+  const el = document.getElementById("auditPermMsg");
+  el.hidden = false;
+  el.innerHTML = msg;
+}
+
+function auditFilterParams() {
+  const p = new URLSearchParams();
+  const op = document.getElementById("afOperator").value.trim();
+  const rv = document.getElementById("afReviewer").value.trim();
+  const act = document.getElementById("afAction").value;
+  const res = document.getElementById("afResult").value;
+  const st = document.getElementById("afStart").value;
+  const en = document.getElementById("afEnd").value;
+  const lim = document.getElementById("afLimit").value;
+  if (op) p.set("operator", op);
+  if (rv) p.set("reviewer", rv);
+  if (act) p.set("action", act);
+  if (res) p.set("result", res);
+  if (st) p.set("start", localToIso(st));
+  if (en) p.set("end", localToIso(en));
+  p.set("limit", lim);
+  Audit.pageSize = Number(lim);
+  return p;
+}
+
+async function auditPage(cursor, dir = "first") {
+  const p = auditFilterParams();
+  if (cursor) p.set("cursor", cursor);
+  const { data } = await auditApi("/api/approvals/timeline?" + p.toString());
+  renderAuditTable(data);
+  Audit.nextCursor = data.next_cursor || "";
+  if (dir === "first") { Audit.pages = []; Audit.pageNo = 1; }
+  document.getElementById("afNext").disabled = !data.has_more;
+  document.getElementById("afPrev").disabled = Audit.pages.length === 0;
+  document.getElementById("afPageInfo").textContent =
+    `第 ${Audit.pageNo} 页 · 本页 ${data.count} 条` +
+    (data.has_more ? " · 还有更多（游标在下一页请求时签名校验，有效期约 5 分钟）" : " · 已到末尾");
+  return data;
+}
+
+function renderAuditTable(d) {
+  const head = ["#", "时刻", "申请号", "动作", "结果", "操作者", "复核者", "对象", "明细"];
+  const rows = d.events.map(e => {
+    let detail = e.detail;
+    try { detail = JSON.stringify(JSON.parse(e.detail), null, 0); } catch { /* 原样 */ }
+    const [cls, label] = RESULT_STYLE[e.result] || ["", e.result];
+    return `<tr>
+      <td>${e.seq}</td>
+      <td class="nowrap">${fmtIso(e.timestamp)}</td>
+      <td>${esc(e.request_id)}</td>
+      <td>${esc(ACTION_LABEL[e.action] || e.action)}<div class="muted tiny">${esc(e.action)}</div></td>
+      <td><span class="tag ${cls}">${label}</span><div class="muted tiny">${esc(e.result)}</div></td>
+      <td>${esc(e.operator)}</td>
+      <td>${esc(e.reviewer || "—")}</td>
+      <td>${esc(e.subject || "—")}</td>
+      <td class="detail-cell" title="${esc(detail)}">${esc(detail)}</td>
+    </tr>`;
+  }).join("");
+  document.getElementById("afTable").innerHTML =
+    `<tr>${head.map(h => `<th>${h}</th>`).join("")}</tr>` +
+    (rows || `<tr><td colspan="9" class="muted">当前过滤条件下没有审批事件</td></tr>`);
+}
+
+document.getElementById("auditToken").addEventListener("change", async (e) => {
+  Audit.token = e.target.value;
+  localStorage.setItem("audit_token", Audit.token);
+  await auditBoot();
+});
+
+document.getElementById("afSearch").addEventListener("click", () => {
+  auditPage("").catch(auditErr);
+});
+document.getElementById("afReset").addEventListener("click", () => {
+  ["afOperator", "afReviewer", "afStart", "afEnd"].forEach(i =>
+    document.getElementById(i).value = "");
+  document.getElementById("afAction").value = "";
+  document.getElementById("afResult").value = "";
+  auditPage("").catch(auditErr);
+});
+document.getElementById("afNext").addEventListener("click", () => {
+  if (!Audit.nextCursor) return;
+  Audit.pages.push(Audit.cursor);
+  Audit.cursor = Audit.nextCursor;
+  Audit.pageNo += 1;
+  auditPage(Audit.cursor).catch((e) => {
+    Audit.pages.pop();
+    Audit.cursor = Audit.pages.length ? Audit.pages[Audit.pages.length - 1] : "";
+    Audit.pageNo -= 1;
+    auditErr(e);
+  });
+});
+document.getElementById("afPrev").addEventListener("click", () => {
+  const prev = Audit.pages.pop() || "";
+  Audit.cursor = prev;
+  Audit.pageNo = Math.max(1, Audit.pageNo - 1);
+  auditPage(prev).catch(auditErr);
+});
+
+function auditErr(e) {
+  const p = e.payload || {};
+  let hint = "";
+  if (p.code === "cursor_expired") {
+    hint = "游标已过期（410）：审批时间线可能已新增决策，请点「查询」回到第一页重新分段读取。";
+    Audit.pages = []; Audit.cursor = ""; Audit.pageNo = 1;
+  } else if (p.code === "cursor_filter_mismatch") {
+    hint = "翻页不能改动过滤条件；请保持筛选不变，或点「查询」回到第一页。";
+  } else if (p.code === "cursor_invalid") {
+    hint = "游标无效或被篡改（400），请回到第一页。";
+  } else if (p.code === "invalid_filter") {
+    hint = "过滤值不合法（400）：" + (p.allowed ? `允许值 ${p.allowed.join(" / ")}` : e.message);
+  } else if (e.status === 401) {
+    hint = "缺少观察权限或令牌无效（401）。";
+  } else if (e.status === 403) {
+    hint = "当前身份没有观察权限（403）。";
+  } else {
+    hint = e.message;
+  }
+  document.getElementById("afMsg").innerHTML =
+    `<div class="unassigned-box">${esc(hint)}</div>`;
+  toast(hint, "err");
+}
+
+// ------------------------------------------------------------ 写入审批事件
+
+document.getElementById("awSubmit").addEventListener("click", async () => {
+  if (!Audit.hasWrite) return toast("当前身份没有 audit:write 权限", "err");
+  let detail = {};
+  const raw = document.getElementById("awDetail").value.trim();
+  if (raw) {
+    try { detail = JSON.parse(raw); }
+    catch { return toast("明细必须是合法 JSON", "err"); }
+  }
+  const body = {
+    action: document.getElementById("awAction").value,
+    result: document.getElementById("awResult").value,
+    request_id: document.getElementById("awRequest").value.trim() || undefined,
+    operator: document.getElementById("awOperator").value.trim() || undefined,
+    reviewer: document.getElementById("awReviewer").value.trim() || undefined,
+    subject: document.getElementById("awSubject").value.trim(),
+    detail,
+    idem_key: "ui_" + Date.now() + "_" + Math.random().toString(36).slice(2, 8),
+  };
+  Object.keys(body).forEach(k => body[k] === undefined && delete body[k]);
+  try {
+    const { data } = await auditApi("/api/approvals/events", { method: "POST", body });
+    toast(`已追加 #${data.seq}：${data.request_id} / ${data.result}`
+      + (data.idempotent_replay ? "（幂等重放）" : ""), "ok");
+    document.getElementById("awRequest").value = data.request_id;
+    // 回到第一页刷新（游标可能因新增事件/过期而失效）
+    Audit.cursor = "";
+    await auditPage("");
+  } catch (e) { toast(e.message, "err"); }
+});
+
+// ------------------------------------------------------------ 报表截面
+
+document.getElementById("afReport").addEventListener("click", async () => {
+  if (!Audit.hasRead) return;
+  const p = auditFilterParams();
+  p.delete("limit");
+  const filters = {};
+  ["operator", "reviewer", "action", "result", "start", "end"].forEach(k => {
+    if (p.has(k)) filters[k === "action" ? "action" : k === "result" ? "result" : k] = p.get(k);
+  });
+  try {
+    const { data } = await auditApi("/api/approvals/reports", {
+      method: "POST",
+      body: {
+        filters,
+        idem_key: "lock_" + JSON.stringify(filters) + "_" +
+          new Date().toISOString().replace(/[^0-9]/g, "").slice(0, 12),
+      },
+    });
+    document.getElementById("afMsg").innerHTML =
+      `<div class="commit-note">✅ 已锁定截面 <b>${data.id}</b>：截止 seq ${data.cutoff_seq}，
+        冻结 ${data.row_count} 行。JSON / CSV 同源、字段顺序一致；重复下载为同一份文件，
+        之后新增决策不进入本截面。</div>`;
+    auditLoadReports();
+  } catch (e) { auditErr(e); }
+});
+
+document.getElementById("afReloadReports").addEventListener("click", auditLoadReports);
+
+async function auditLoadReports() {
+  if (!Audit.hasRead) return;
+  const box = document.getElementById("afReports");
+  try {
+    const { data } = await auditApi("/api/approvals/reports");
+    if (!data.reports.length) {
+      box.innerHTML = '<p class="muted">尚无锁定截面。设置过滤条件后点击「按当前条件锁定截面并生成报表」。</p>';
+      return;
+    }
+    box.innerHTML = data.reports.map(r => `
+      <div class="report-row" data-id="${esc(r.id)}">
+        <div>
+          <b>${esc(r.id)}</b>
+          <span class="muted">${fmtIso(r.created_at)} · ${esc(r.created_by)} ·
+            ${r.row_count} 行 · 截止 seq ${r.cutoff_seq}</span>
+          <div class="tiny muted">${esc(auditFilterSummary(r.filters))}</div>
+        </div>
+        <div class="report-actions">
+          <a href="${r.formats.json.url}" class="dl" data-fmt="json">下载 JSON</a>
+          <a href="${r.formats.csv.url}" data-fmt="csv">下载 CSV</a>
+          <button class="mini verify">校验完整性</button>
+        </div>
+        <div class="verify-out tiny" hidden></div>
+      </div>`).join("");
+    box.querySelectorAll(".dl, a[data-fmt]").forEach(a =>
+      a.addEventListener("click", onDownloadReport));
+    box.querySelectorAll(".verify").forEach(b =>
+      b.addEventListener("click", onVerifyReport));
+  } catch (e) { box.innerHTML = `<p class="muted">${esc(e.message)}</p>`; }
+}
+
+function auditFilterSummary(f) {
+  const parts = [];
+  if (f.operator) parts.push(`操作者=${f.operator}`);
+  if (f.reviewer) parts.push(`复核者=${f.reviewer}`);
+  if (f.actions && f.actions.length) parts.push(`动作=${f.actions.join(",")}`);
+  if (f.results && f.results.length) parts.push(`结果=${f.results.join(",")}`);
+  if (f.start) parts.push(`起=${f.start}`);
+  if (f.end) parts.push(`止=${f.end}`);
+  return parts.length ? parts.join(" ｜ ") : "无条件（全部事件）";
+}
+
+async function onDownloadReport(e) {
+  // 带审计令牌直接 fetch 为 Blob 触发下载（a 标签无法携带 Authorization 头）
+  e.preventDefault();
+  const a = e.currentTarget;
+  const fmt = a.dataset.fmt;
+  const url = a.getAttribute("href");
+  try {
+    const r = await fetch(url, { headers: auditHeaders() });
+    if (!r.ok) {
+      const p = await r.json().catch(() => ({}));
+      throw new Error(p.error || `HTTP ${r.status}`);
+    }
+    const blob = await r.blob();
+    const href = URL.createObjectURL(blob);
+    const tmp = document.createElement("a");
+    tmp.href = href;
+    // URL 形如 /api/approvals/reports/{id}/download
+    const rid = url.split("/")[4];
+    tmp.download = `${rid}.${fmt}`;
+    tmp.click();
+    URL.revokeObjectURL(href);
+    toast(`${fmt.toUpperCase()} 已下载（冻结截面，重复下载逐字节相同）`, "ok");
+  } catch (err) { toast(err.message, "err"); }
+}
+
+async function onVerifyReport(e) {
+  const row = e.currentTarget.closest(".report-row");
+  const id = row.dataset.id;
+  const out = row.querySelector(".verify-out");
+  out.hidden = false;
+  out.textContent = "校验中…";
+  try {
+    const { data } = await auditApi(`/api/approvals/reports/${id}/verify`,
+                                    { method: "POST" });
+    out.innerHTML = data.ok
+      ? `<span class="tag ok">校验通过</span> JSON sha256 ${data.json.match ? "✓" : "✗"} ·
+         CSV sha256 ${data.csv.match ? "✓" : "✗"} · 列一致 ${data.columns_match ? "✓" : "✗"} ·
+         截面完整 ${data.snapshot_intact ? "✓" : "✗"}（最大 seq ${data.max_row_seq} ≤ 截止 ${data.cutoff_seq}）`
+      : `<span class="tag bad">校验失败</span> ${JSON.stringify(data)}`;
+  } catch (err) { out.textContent = "校验失败：" + err.message; }
+}
+
+// 切到审批页时初始化（带令牌的查询由本页按钮驱动，不参与全局 6 秒轮询）
+document.querySelectorAll(".tab").forEach(t => t.addEventListener("click", () => {
+  if (t.dataset.tab === "audit") auditBoot();
+}));

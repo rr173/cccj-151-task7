@@ -18,6 +18,7 @@
     <button data-tab="resources" class="tab">资源与导入</button>
     <button data-tab="households" class="tab">受威胁住户</button>
     <button data-tab="log" class="tab">事件日志</button>
+    <button data-tab="audit" class="tab audit-tab">审批追踪</button>
   </nav>
   <div class="revbox">
     <span>修订号 <b id="revision">–</b></span>
@@ -226,9 +227,65 @@
       <div id="logList"></div>
     </div>
   </section>
+
+  <!-- ============ 审批追踪工作台（运营审计） ============ -->
+  <section id="tab-audit" class="tabpanel">
+    <div class="card">
+      <div class="row-between">
+        <h2>审批追踪工作台</h2>
+        <div class="audit-login">
+          <span class="muted">审计身份</span>
+          <select id="auditPrincipal" class="inp small"></select>
+          <span id="auditPermTag" class="perm-tag"></span>
+        </div>
+      </div>
+      <p class="muted">把每条申请的<b>申请 / 批准 / 拒绝 / 失效 / 执行失败</b>按申请编号串成可检索时间线；
+        支持操作者、复核者、动作种类、结果状态与起止时刻组合过滤，游标分段读取。
+        报表在创建瞬间锁定查询截面，JSON 与 CSV 字段/顺序/明细完全相同，重复下载为同一份文件。</p>
+    </div>
+
+    <div class="card">
+      <h3>组合过滤</h3>
+      <div class="audit-filters">
+        <label>申请编号 <input id="afRequest" class="inp small" placeholder="如 REQ-EVAC-1001"></label>
+        <label>操作者 <input id="afActor" class="inp small" placeholder="如 图调度"></label>
+        <label>复核者 <input id="afReviewer" class="inp small" placeholder="如 闻复核"></label>
+        <label>动作种类
+          <select id="afAction" class="inp small"></select>
+        </label>
+        <label>结果状态
+          <select id="afResult" class="inp small"></select>
+        </label>
+        <label>起始时刻 <input id="afFrom" type="datetime-local" step="1" class="inp small"></label>
+        <label>截止时刻 <input id="afTo" type="datetime-local" step="1" class="inp small"></label>
+        <label>每段条数 <input id="afLimit" type="number" min="1" max="200" value="20" class="inp xs"></label>
+        <div class="audit-filter-btns">
+          <button id="auditSearchBtn" class="primary">查询时间线</button>
+          <button id="auditNextBtn" class="mini" disabled>读取下一段 →</button>
+          <button id="auditResetBtn" class="mini">清空过滤</button>
+        </div>
+      </div>
+      <div id="auditErr" class="audit-err" hidden></div>
+      <div id="auditPageMeta" class="muted audit-meta"></div>
+      <div class="diff-table-wrap"><table class="grid-table" id="auditTable"></table></div>
+    </div>
+
+    <div class="card">
+      <div class="row-between">
+        <h3>报表（锁定查询截面）</h3>
+        <div>
+          <button id="reportCreateBtn" class="publish">按当前过滤生成报表（JSON/CSV 同截面）</button>
+        </div>
+      </div>
+      <div id="reportMsg"></div>
+      <div id="reportList" class="report-list"></div>
+    </div>
+  </section>
 </main>
 
 <div id="toast"></div>
 <script src="/app.js"></script>
+<script src="/audit.js"></script>
+<script>initAuditTab();</script>
 </body>
 </html>

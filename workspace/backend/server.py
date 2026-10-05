@@ -22,21 +22,40 @@ from planner import Snapshot, plan as run_plan, validate_plan
 from seed import seed
 import branches as branches_mod
 import relay_link
+import approval
 
 FRONTEND_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "frontend")
 DB_PATH = os.environ.get("EVAC_DB", os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                                 "..", "data", "evac.db"))
 
 db = DB(DB_PATH)
+approval.ensure_principals(db)
 if os.environ.get("EVAC_NO_SEED") != "1" and db.revision() == 0 and not db.get_meta("seeded"):
     seed(db)
     db.set_meta("seeded", "1")
+approval.seed_demo_decisions(db)
 
 
 # ---------------------------------------------------------------- 通用工具
 
 def now_id(prefix):
     return f"{prefix}_{uuid.uuid4().hex[:12]}"
+
+
+def safe_record(d, **kw):
+    """业务流程追加审批决策：台账故障绝不阻断主业务（审计旁路，失败仅留事件日志）。"""
+    try:
+        return approval.record_decision(d, **kw)
+    except Exception as e:  # noqa: BLE001
+        try:
+            d.log_event("approval_record_failed",
+                        json.dumps({"error": str(e), "args": {k: str(v)[:120]
+                                                              for k, v in kw.items()}},
+                                   ensure_ascii=False))
+            d.commit()
+        except Exception:
+            pass
+        return None
 
 
 def rows(d, table):
@@ -58,6 +77,15 @@ def release_scheduled_batches(d, where_sql, params=(), reason=""):
         released.extend(hs)
         d.conn.execute("DELETE FROM assignments WHERE batch_id=?", (bid,))
         d.conn.execute("UPDATE batches SET status='cancelled' WHERE id=?", (bid,))
+        brow = d.conn.execute(
+            "SELECT vehicle_code,shelter_code FROM batches WHERE id=?", (bid,)).fetchone()
+        # 审批追踪：已批准但未出发的批次失效（撤回）——结果状态 expired
+        safe_record(
+            d, action_kind="batch_expire", result="expired", request_id=bid,
+            actor="system", reviewer="", target_type="batch", target_ref=bid,
+            detail={"reason": reason, "released_households": hs,
+                    "vehicle": brow["vehicle_code"] if brow else "",
+                    "shelter": brow["shelter_code"] if brow else ""})
     if batch_ids:
         d.log_event("batch_cancelled",
                     json.dumps({"batches": batch_ids, "released": released,
@@ -241,6 +269,15 @@ def create_plan(d, body):
         (pid, body.get("name", "候选方案"), body.get("commander", ""),
          d.revision(), json.dumps(result, ensure_ascii=False), time.time()))
     d.commit()
+    # 审批追踪：方案（撤离令申请）提交，等待复核发布
+    safe_record(
+        d, action_kind="order_submit", result="submitted", request_id=pid,
+        actor=body.get("commander", ""), reviewer="", target_type="plan",
+        target_ref=pid,
+        detail={"name": body.get("name", "候选方案"), "base_revision": d.revision(),
+                "feasible": result.get("feasible"),
+                "batches": len(result.get("batches", [])),
+                "unassigned": len(result.get("unassigned", []))})
     result["id"] = pid
     result["revision"] = d.revision()
     return result
@@ -282,20 +319,39 @@ def publish_plan(d, pid, body):
     if not row:
         raise NotFound("方案不存在")
     if row["status"] == "published":
+        _record_publish_decision(
+            d, pid, row, body, "rejected", "order_reject",
+            {"reason": "该方案已经发布，不能重复生效"})
         raise Conflict("该方案已经发布，不能重复生效")
     payload = json.loads(row["payload"])
     if not payload["feasible"]:
+        _record_publish_decision(
+            d, pid, row, body, "rejected", "order_reject",
+            {"reason": "方案含无法安置的家庭，不能发布",
+             "unassigned": [u.get("ref") for u in payload.get("unassigned", [])][:20]})
         raise Conflict("方案含无法安置的家庭，不能发布；请先恢复资源或调整约束")
     if row["base_revision"] != d.revision():
+        # 乐观并发失败：申请基于的态势截面已经失效 → expired（失效）
+        _record_publish_decision(
+            d, pid, row, body, "expired", "order_reject",
+            {"reason": "方案已过期：制定后态势修订号已推进",
+             "base_revision": row["base_revision"],
+             "current_revision": d.revision()})
         raise Conflict(
             f"方案已过期：制定于修订号 {row['base_revision']}，当前为 {d.revision()}，"
             "已有其他指挥员发布或资源状态发生变化，请基于最新方案重新发布")
     if not payload["batches"]:
+        _record_publish_decision(
+            d, pid, row, body, "rejected", "order_reject",
+            {"reason": "方案为空（当前没有待撤离家庭）"})
         raise Conflict("方案为空（当前没有待撤离家庭）")
 
     # 发布前独立复核全部硬约束（基于当前最新快照，防止方案制定后资源已变）
     violations = validate_plan(Snapshot(d), payload["batches"])
     if violations:
+        _record_publish_decision(
+            d, pid, row, body, "rejected", "order_reject",
+            {"reason": "方案违反硬约束，禁止发布", "violations": violations[:20]})
         raise Conflict("方案违反硬约束，禁止发布：" + "；".join(violations[:8])
                        + ("……" if len(violations) > 8 else ""))
 
@@ -326,8 +382,23 @@ def publish_plan(d, pid, body):
                 json.dumps({"order": oid, "plan": pid, "commander": commander,
                             "batches": len(payload["batches"])}, ensure_ascii=False))
     d.commit()
+    # 审批追踪：复核通过并发布 —— approved
+    safe_record(
+        d, action_kind="order_approve", result="approved", request_id=pid,
+        actor=row["commander"], reviewer=commander, target_type="plan", target_ref=pid,
+        detail={"order_id": oid, "revision": rev, "batches": len(payload["batches"]),
+                "base_revision": row["base_revision"]})
     return {"order_id": oid, "plan_id": pid, "revision": rev,
             "batches": len(payload["batches"])}
+
+
+def _record_publish_decision(d, pid, plan_row, body, result, action, detail):
+    """发布被拒/失效的审批留痕（与异常抛出前同一事务语义，立即持久化）。"""
+    reviewer = body.get("commander", plan_row["commander"])
+    safe_record(
+        d, action_kind=action, result=result, request_id=pid,
+        actor=plan_row["commander"], reviewer=reviewer,
+        target_type="plan", target_ref=pid, detail=detail)
 
 
 def depart_batch(d, bid, body):
@@ -336,6 +407,12 @@ def depart_batch(d, bid, body):
     if not b:
         raise NotFound("批次不存在")
     if b["status"] != "scheduled":
+        # 批次已离场/已撤回：执行申请针对的是已失效对象
+        safe_record(
+            d, action_kind="batch_depart", result="expired", request_id=bid,
+            actor=str(body.get("commander", "")), reviewer="",
+            target_type="batch", target_ref=bid,
+            detail={"reason": f"批次当前状态为 {b['status']}，离场申请不受理"})
         raise Conflict(f"批次当前状态为 {b['status']}，无法标记离场")
 
     ts = time.time()
@@ -353,6 +430,13 @@ def depart_batch(d, bid, body):
                             "shelter": b["shelter_code"], "released": released},
                            ensure_ascii=False))
     d.commit()
+    # 审批追踪：离场执行成功 —— approved（批准已随发布完成，这里记录执行落地）
+    safe_record(
+        d, action_kind="batch_depart", result="approved", request_id=bid,
+        actor=str(body.get("commander", "")), reviewer="",
+        target_type="batch", target_ref=bid,
+        detail={"vehicle": b["vehicle_code"], "shelter": b["shelter_code"],
+                "wave": b["wave"], "released_for_replan": released})
     return {"batch": bid, "status": "departed", "released_for_replan": released,
             "revision": rev}
 
@@ -430,6 +514,10 @@ def _cancel_batches_on_road(d, road_code, reason):
         released.extend(hs)
         d.conn.execute("DELETE FROM assignments WHERE batch_id=?", (bid,))
         d.conn.execute("UPDATE batches SET status='cancelled' WHERE id=?", (bid,))
+        safe_record(
+            d, action_kind="batch_expire", result="expired", request_id=bid,
+            actor="system", reviewer="", target_type="batch", target_ref=bid,
+            detail={"reason": reason, "road": road_code, "released_households": hs})
     if ids:
         d.log_event("batch_cancelled",
                     json.dumps({"batches": ids, "released": released,
@@ -567,6 +655,20 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def _audit_error(self, e):
+        self._json(e.status, {"error": e.message, "code": e.code, **e.extra})
+
+    def _bytes(self, status, body, ctype, filename, etag=None):
+        self.send_response(status)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Cache-Control", "no-store")
+        if etag:
+            self.send_header("ETag", f'"{etag}"')
+        self.end_headers()
+        self.wfile.write(body)
+
     def _read_body(self):
         n = int(self.headers.get("Content-Length", 0))
         if not n:
@@ -599,6 +701,25 @@ class Handler(BaseHTTPRequestHandler):
         u = urlparse(self.path)
         p = u.path
         try:
+            # ---- 审批追踪报表下载（支持浏览器直连 ?token=，不走全局业务锁以外的逻辑）----
+            if p.startswith("/api/audit/reports/") and p.endswith("/content"):
+                with db.lock:
+                    from urllib.parse import parse_qs
+                    qs = parse_qs(u.query)
+                    fmt = qs.get("format", ["json"])[0]
+                    rid = p.split("/")[4]
+                    token = qs.get("token", [None])[0]
+                    try:
+                        approval.require_observer(
+                            db, self.headers.get("X-Audit-User"), token)
+                        body, ctype, filename = approval.render_report(db, rid, fmt)
+                        rep = db.conn.execute(
+                            "SELECT sha256 FROM audit_reports WHERE id=?", (rid,)).fetchone()
+                        return self._bytes(200, body, ctype, filename,
+                                           etag=rep["sha256"] if rep else None)
+                    except approval.AuditError as e:
+                        return self._audit_error(e)
+
             with db.lock:
                 # ---- 推演分支只读接口 ----
                 if p.startswith("/api/branches/"):
@@ -636,9 +757,34 @@ class Handler(BaseHTTPRequestHandler):
                     bid = p.rsplit("/", 1)[-1]
                     return self._json(200,
                                       relay_link.build_execution_package(db, bid))
+
+                # ---- 审批追踪工作台 ----
+                if p == "/api/audit/principals":
+                    # 身份列表本身公开（选择登录身份用）；不返回令牌
+                    return self._json(200, {"principals": approval.list_principals(db)})
+                if p == "/api/audit/whoami":
+                    return self._json(200, {"principal": dict(approval.authenticate(
+                        db, self.headers.get("X-Audit-User")))})
+                if p == "/api/audit/decisions":
+                    principal = approval.require_observer(
+                        db, self.headers.get("X-Audit-User"))
+                    from urllib.parse import parse_qs
+                    qs = parse_qs(u.query)
+                    res = approval.query_timeline(db, approval.filters_from_qs(qs))
+                    res["queried_by"] = principal["login"]
+                    return self._json(200, res)
+                if p == "/api/audit/reports":
+                    approval.require_observer(db, self.headers.get("X-Audit-User"))
+                    return self._json(200, {"reports": approval.list_reports(db)})
+                if p.startswith("/api/audit/reports/"):
+                    approval.require_observer(db, self.headers.get("X-Audit-User"))
+                    rid = p.rsplit("/", 1)[-1]
+                    return self._json(200, approval.get_report_meta(db, rid))
             if p.startswith("/api/"):
                 raise NotFound("未知接口")
             return self._static(p)
+        except approval.AuditError as e:
+            self._audit_error(e)
         except branches_mod.BranchError as e:
             self._json(e.status, {"error": str(e), "code": e.code, **e.extra})
         except relay_link.RelayLinkError as e:
@@ -695,9 +841,52 @@ class Handler(BaseHTTPRequestHandler):
                 if p == "/api/relay-callback":
                     status_code, resp, _replay = relay_link.receive_relay_callback(
                         db, body or {})
+                    # 审批追踪：回执是离场执行的现场结果；只对首次回执留痕
+                    if not _replay and body:
+                        bref = str(body.get("batch_ref", ""))
+                        rtype = str(body.get("type") or body.get("receipt_type") or "")
+                        if resp.get("result") == "ack":
+                            # arrived/failed_to_depart 的 ack 不直接改变批次状态；
+                            # departed 已由 depart_batch 记 approved，这里仅补一条回执链
+                            safe_record(
+                                db, action_kind="relay_receipt", result="approved",
+                                request_id=bref, actor="relay", reviewer="",
+                                target_type="batch", target_ref=bref,
+                                detail={"receipt_type": rtype,
+                                        "seq": body.get("seq"),
+                                        "receipt_no": body.get("receipt_no")})
+                        else:
+                            reason = resp.get("reason", "")
+                            result = ("expired" if reason == "batch_withdrawn"
+                                      else "exec_failed")
+                            safe_record(
+                                db, action_kind="relay_receipt", result=result,
+                                request_id=bref, actor="relay", reviewer="",
+                                target_type="batch", target_ref=bref,
+                                detail={"receipt_type": rtype, "reason": reason,
+                                        "message": resp.get("message", ""),
+                                        "seq": body.get("seq"),
+                                        "receipt_no": body.get("receipt_no")})
                     return self._json(status_code, resp)
+
+                # ---- 审批追踪工作台 ----
+                if p == "/api/audit/decisions":
+                    principal = approval.authenticate(db, self.headers.get("X-Audit-User"))
+                    return self._json(200, {"decision": approval.create_manual_decision(
+                        db, principal, body or {})})
+                if p == "/api/audit/reports":
+                    principal = approval.require_observer(
+                        db, self.headers.get("X-Audit-User"))
+                    return self._json(201, approval.create_report(db, principal, body or {}))
+                if p == "/api/audit/reset-demo":
+                    principal = approval.require_observer(
+                        db, self.headers.get("X-Audit-User"))
+                    approval.reset_demo(db)
+                    return self._json(200, {"ok": True})
                 if p == "/api/reset":
                     seed(db, reset=True)
+                    # 审批追踪台账与查询截面一并重置为演示状态（身份保留）
+                    approval.reset_demo(db)
                     # 清理已删除元数据的孤立分支数据库文件
                     bdir = os.path.join(os.path.dirname(os.path.abspath(db.path)), "branches")
                     if os.path.isdir(bdir):
@@ -712,8 +901,11 @@ class Handler(BaseHTTPRequestHandler):
                     db.bump_revision()
                     db.log_event("reset", "{}")
                     db.commit()
+                    approval.seed_demo_decisions(db, force=True)
                     return self._json(200, {"ok": True, "revision": db.revision()})
             raise NotFound("未知接口")
+        except approval.AuditError as e:
+            self._audit_error(e)
         except branches_mod.BranchError as e:
             self._json(e.status, {"error": str(e), "code": e.code, **e.extra})
         except relay_link.RelayLinkError as e:

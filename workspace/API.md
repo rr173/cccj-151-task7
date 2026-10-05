@@ -145,3 +145,59 @@
   - 合法回执返回 `{"result":"ack"}`；`departed` 类联动既有离场承诺语义。
 
 中继自身 API（执行包导入、终端下载、批量回执、重试、审计）见 [relay/API.md](relay/API.md)。
+
+## 运营审计：审批追踪工作台
+
+独立的审计视图（[backend/approval.py](backend/approval.py)），与编排业务共享数据库但**只追加**：
+每条撤离令/批次的申请、批准、拒绝、失效、执行失败都以 `request_id` 串成时间线
+（`approval_decisions`，`seq` 单调递增，永不变更/删除）。业务动作（方案提交、发布批准/
+拒绝、乐观并发过期、撤回失效、离场执行、中继回执）自动落账，也可人工录入备注。
+
+### 身份与观察权限（演示轻量模型）
+
+- 所有 `/api/audit/*` 请求需头 `X-Audit-User: <login>`；浏览器直连下载可用 `?token=<下载令牌>`。
+- 预置身份：`auditor.lin`（审计，可观察）、`reviewer.wen`（复核，可观察）、
+  `planner.tu`（调度，无观察权）、`ops.wu`（车班，无观察权）。
+- 错误：缺身份 **401 unauthenticated**；未知身份/坏令牌 **403 unknown_principal / bad_download_token**；
+  无观察权限 **403 observe_forbidden**。
+- `GET /api/audit/principals`（公开，不含令牌）、`GET /api/audit/whoami`。
+
+### 时间线查询：组合过滤 + 游标分段
+
+`GET /api/audit/decisions`，查询参数（可任意组合，重复/逗号分隔支持多值）：
+
+| 参数 | 含义 | 校验 |
+|---|---|---|
+| `request_id` | 申请编号（单值），拉出一条申请的完整生命周期链 | 长度 ≤80 |
+| `actor` | 操作者（单值） | 长度 ≤64 |
+| `reviewer` | 复核者（单值） | 长度 ≤64 |
+| `action` | 动作种类，多值 | `order_submit/order_approve/order_reject/batch_depart/batch_expire/relay_receipt/manual_note` |
+| `result` | 结果状态，多值 | `submitted/approved/rejected/expired/exec_failed` |
+| `time_from` / `time_to` | 起止时刻（epoch 秒或 ISO 8601，含端点） | 起始不得晚于截止 |
+| `limit` | 每段条数 | 1..200，默认 50 |
+| `cursor` | 上一段响应里的 `next_cursor`（不透明） | 见下 |
+
+- 未知参数名、非法枚举/时间/limit 一律 **400 invalid_filter**（中文消息明确指出出错字段）。
+- 响应按 `seq` 倒序：`{filters,total_matching,page_size,next_cursor,cursor_expires_in,fields,decisions[]}`。
+- 游标**与创建时过滤条件签名绑定**：分页中改动任何过滤值 → **400 cursor_filter_mismatch**；
+  游标不存在/被伪造 → **410 cursor_expired**；超过 TTL（默认 1800s，`EVAC_CURSOR_TTL` 可调）
+  → **410 cursor_expired**。游标持久化在 `audit_cursors`，**进程重启后仍可续读**。
+
+### 截面锁定报表（JSON / CSV 同一份内容）
+
+- `POST /api/audit/reports`，体为过滤条件（同查询参数名）+ 可选 `idem_key`。
+  - 创建瞬间锁定水位 `snapshot_seq = 当前最大 seq`，并把命中行**物化冻结**到 `audit_reports`；
+  - 相同 `idem_key` 重试返回同一报表（`idempotent_replay:true`）；前端按过滤条件哈希生成稳定键，
+    重复点击下载只能拿到同一份文件。
+- `GET /api/audit/reports` — 报表列表；`GET /api/audit/reports/{id}` — 元数据。
+- `GET /api/audit/reports/{id}/content?format=json|csv`（需观察权限或 `?token=`）。
+  - 两格式**字段、顺序、明细逐格相同**，字段固定为：
+    `seq, ts(UTC ISO), request_id, actor, reviewer, action_kind, result, target_type, target_ref, detail`
+    （`detail` 在 JSON 与 CSV 中都是同一段紧凑 JSON 文本）；
+  - 输出确定（固定键序/换行），任意时刻重复下载**字节级一致**；带 `ETag`（冻结内容 SHA256）；
+  - 读取时复核 SHA256，冻结内容被篡改/损坏 → **500 snapshot_tampered**；
+  - **进程重启后旧报表仍可校验、读取**；截面之后新增的决策绝不进入先前报表
+    （新报表才会看到更高水位）。非法格式 **400 bad_format**，未知报表 **404 not_found**。
+- `POST /api/audit/decisions`（任意已登记身份）人工录入一条决策；
+  `POST /api/audit/reset-demo`（需观察权限）恢复演示时间线。
+

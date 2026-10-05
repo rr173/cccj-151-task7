@@ -175,6 +175,63 @@ CREATE TABLE IF NOT EXISTS execution_exports(
   package_hash  TEXT NOT NULL DEFAULT '',
   exported_at   REAL NOT NULL
 );
+
+-- ===================== 运营审计：审批追踪工作台 =====================
+-- 审批决策只追加台账（append-only；任何 UPDATE/DELETE 都被视为破坏审计完整性）。
+-- 一条申请从 submitted -> approved/rejected/expired/exec_failed 用相同 request_id
+-- 串成可检索时间线；seq 为单调游标，报表截面就是某个 seq 水位。
+CREATE TABLE IF NOT EXISTS approval_decisions(
+  seq         INTEGER PRIMARY KEY AUTOINCREMENT,
+  request_id  TEXT NOT NULL,             -- 同一申请的多条决策共享（如方案 id / 批次 id）
+  ts          REAL NOT NULL,             -- 事件时刻（unix 秒）
+  actor       TEXT NOT NULL DEFAULT '',  -- 操作者（发起/执行动作的人或系统）
+  reviewer    TEXT NOT NULL DEFAULT '',  -- 复核者（批准/拒绝动作的责任人）
+  action_kind TEXT NOT NULL,             -- 动作种类，见 approval.ALLOWED_ACTIONS
+  result      TEXT NOT NULL,             -- submitted | approved | rejected | expired | exec_failed
+  target_type TEXT NOT NULL DEFAULT '',  -- 对象类型：plan | batch | vehicle | shelter | road
+  target_ref  TEXT NOT NULL DEFAULT '',  -- 对象编号
+  detail      TEXT NOT NULL DEFAULT '{}', -- JSON 明细（决定/失败原因等，紧凑序列化）
+  dedup_key   TEXT UNIQUE                -- 防重键：同键决策只入账一次（演示重灌/重试用）
+);
+CREATE INDEX IF NOT EXISTS idx_approval_ts ON approval_decisions(ts);
+CREATE INDEX IF NOT EXISTS idx_approval_request ON approval_decisions(request_id);
+CREATE INDEX IF NOT EXISTS idx_approval_filter ON approval_decisions(action_kind, result, actor, reviewer);
+
+-- 审计身份与观察权限（演示用轻量模型；以 X-Audit-User 头标识主体）。
+CREATE TABLE IF NOT EXISTS audit_principals(
+  login       TEXT PRIMARY KEY,
+  name        TEXT NOT NULL DEFAULT '',
+  role        TEXT NOT NULL,             -- auditor | reviewer | planner | ops
+  can_observe INTEGER NOT NULL DEFAULT 0,-- 是否拥有审批观察权限
+  token       TEXT NOT NULL DEFAULT '',  -- 下载访问令牌（?token=，便于浏览器直接下载）
+  created_at  REAL NOT NULL
+);
+
+-- 查询游标：持久化（重启仍可校验），带过滤器签名与过期时刻。
+CREATE TABLE IF NOT EXISTS audit_cursors(
+  token       TEXT PRIMARY KEY,          -- 不透明游标令牌
+  filter_hash TEXT NOT NULL,             -- 创建时过滤条件规范化哈希（换条件必须重新开查）
+  after_seq   INTEGER NOT NULL,          -- 已读到的最后一个 seq
+  page_limit  INTEGER NOT NULL,
+  expires_at  REAL NOT NULL,
+  created_at  REAL NOT NULL
+);
+
+-- 报表截面：创建时锁定 snapshot_seq；行内容在创建时物化冻结，
+-- 之后新增决策绝不改写先前截面。JSON/CSV 仅对同一冻结行集做不同渲染。
+CREATE TABLE IF NOT EXISTS audit_reports(
+  id          TEXT PRIMARY KEY,
+  filter_hash TEXT NOT NULL,             -- 锁定时的过滤条件规范化哈希
+  filter_json TEXT NOT NULL,             -- 过滤条件原文（回显用）
+  snapshot_seq INTEGER NOT NULL,         -- 截面水位：只含 seq <= 该值的决策
+  snapshot_ts REAL NOT NULL,             -- 锁定时刻
+  created_by  TEXT NOT NULL DEFAULT '',
+  idem_key    TEXT UNIQUE,               -- 重复点击下载的幂等键
+  row_count   INTEGER NOT NULL,
+  rows_json   TEXT NOT NULL,             -- 冻结行（固定字段/顺序），两格式共用
+  sha256      TEXT NOT NULL,             -- rows_json 规范序列化的 SHA256（完整性校验）
+  created_at  REAL NOT NULL
+);
 """
 
 
@@ -189,9 +246,22 @@ class DB:
         self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript(SCHEMA)
+        self._migrate()
         self.conn.commit()
         if self.get_meta("revision") is None:
             self.set_meta("revision", "0")
+
+    def _migrate(self):
+        """对老库幂等补列/补索引（CREATE TABLE IF NOT EXISTS 不会改变已存在的表）。"""
+        cols = {r["name"] for r in self.conn.execute(
+            "PRAGMA table_info(approval_decisions)")}
+        if cols and "dedup_key" not in cols:
+            self.conn.execute(
+                "ALTER TABLE approval_decisions ADD COLUMN dedup_key TEXT")
+        # 新库（列随建表存在）与老库（刚补列）统一在这里建唯一索引
+        self.conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_approval_dedup"
+            " ON approval_decisions(dedup_key)")
 
     # ---- meta / revision ----
     def get_meta(self, key):
